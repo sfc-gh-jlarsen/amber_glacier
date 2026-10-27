@@ -1,0 +1,48 @@
+-- Persist experiment scores into a table so the Streamlit app (and automations) can read them with plain SQL.
+USE SCHEMA OFFICEHOURS_20261027.SAP_FINANCIALS;
+
+CREATE TABLE IF NOT EXISTS AI_EXPERIMENT_RESULTS (
+  STAGE VARCHAR, EXPERIMENT VARCHAR, RUN_NAME VARCHAR, MODEL VARCHAR, SCORE FLOAT, VAL_SCORE FLOAT,
+  EST_COST FLOAT, IS_FRONTIER BOOLEAN, STATUS VARCHAR, CAPTURED_AT TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE PROCEDURE SP_CAPTURE_EXPERIMENTS()
+RETURNS VARCHAR
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  n NUMBER DEFAULT 0;
+BEGIN
+  DELETE FROM AI_EXPERIMENT_RESULTS;
+  -- Evaluations of the seed (baseline) functions
+  SHOW RUNS IN EXPERIMENT EVAL_CLASSIFY_DISPUTE_HAIKU_SEED;
+  INSERT INTO AI_EXPERIMENT_RESULTS
+    SELECT '1 Evaluate (seed)', 'EVAL_CLASSIFY_DISPUTE_HAIKU_SEED', "name", 'claude-haiku-4-5',
+           PARSE_JSON("metadata"):metrics:score:value::FLOAT, NULL, NULL, NULL, PARSE_JSON("metadata"):status::VARCHAR, CURRENT_TIMESTAMP()
+    FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+  SHOW RUNS IN EXPERIMENT EVAL_CLASSIFY_DISPUTE_SONNET_SEED;
+  INSERT INTO AI_EXPERIMENT_RESULTS
+    SELECT '1 Evaluate (seed)', 'EVAL_CLASSIFY_DISPUTE_SONNET_SEED', "name", 'claude-sonnet-4-6',
+           PARSE_JSON("metadata"):metrics:score:value::FLOAT, NULL, NULL, NULL, PARSE_JSON("metadata"):status::VARCHAR, CURRENT_TIMESTAMP()
+    FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+  -- Optimization candidates (model is a run parameter; scores are run metrics)
+  SHOW RUNS IN EXPERIMENT CLASSIFY_DISPUTE_OPT_EXP;
+  INSERT INTO AI_EXPERIMENT_RESULTS
+    SELECT IFF("name" = 'SEED', '2 Optimize (seed)', '3 Optimize (candidate)'), 'CLASSIFY_DISPUTE_OPT_EXP', "name",
+           NULL, PARSE_JSON("metadata"):metrics:test_score:value::FLOAT, PARSE_JSON("metadata"):metrics:val_score:value::FLOAT,
+           PARSE_JSON("metadata"):metrics:cost_compared_to_seed:value::FLOAT, PARSE_JSON("metadata"):metrics:is_frontier:value::FLOAT = 1,
+           PARSE_JSON("metadata"):status::VARCHAR, CURRENT_TIMESTAMP()
+    FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+  -- model is a run parameter: look it up per optimization run
+  LET c CURSOR FOR SELECT RUN_NAME FROM AI_EXPERIMENT_RESULTS WHERE EXPERIMENT = 'CLASSIFY_DISPUTE_OPT_EXP';
+  FOR rec IN c DO
+    LET run VARCHAR := rec.RUN_NAME;
+    EXECUTE IMMEDIATE 'SHOW RUN PARAMETERS IN EXPERIMENT CLASSIFY_DISPUTE_OPT_EXP RUN ' || run;
+    UPDATE AI_EXPERIMENT_RESULTS SET MODEL = (SELECT MAX("value") FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "name" = 'model')
+      WHERE EXPERIMENT = 'CLASSIFY_DISPUTE_OPT_EXP' AND RUN_NAME = :run;
+  END FOR;
+  SELECT COUNT(*) INTO :n FROM AI_EXPERIMENT_RESULTS;
+  RETURN n || ' experiment runs captured';
+END;
+$$;
